@@ -1,0 +1,238 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+#
+# apple-notes - CLI for Apple Notes CRUD and search
+#
+# Usage:
+#   apple-notes list    [--limit 20] [--folder NAME]
+#   apple-notes show    <ID>  [--html]
+#   apple-notes search  <query> [--limit 20] [--folder NAME]
+#   apple-notes folders
+#   apple-notes create  "Title" [--body TEXT] [--html HTML] [--folder NAME]
+#   apple-notes update  <ID> [--body TEXT] [--html HTML] [--append TEXT] [--name TITLE]
+#   apple-notes delete  <ID>
+#
+# ID can be a numeric ID (e.g. 1214) or a CoreData URI.
+# Read operations use SQLite for speed. Write operations use AppleScript.
+#
+# Output: JSON to stdout
+
+require 'bundler/setup'
+require 'json'
+require 'optparse'
+require_relative 'lib/notes_db'
+require_relative 'lib/notes_apple'
+
+# --------------------------------------------------------------------------
+# Output helpers
+# --------------------------------------------------------------------------
+
+def output(data)
+  puts JSON.generate(data)
+end
+
+def success(data)
+  output(ok: true, data: data)
+  exit 0
+end
+
+def error(msg, code = 'ERROR')
+  output(ok: false, error: msg, code: code)
+  exit 1
+end
+
+# --------------------------------------------------------------------------
+# ID resolution: numeric ID -> CoreData URI for AppleScript
+# --------------------------------------------------------------------------
+
+def resolve_uri(id)
+  db = NotesDB.open_db
+  z_pk = NotesDB.parse_id(id)
+  uri = NotesDB.note_uri(db, z_pk)
+  db.close
+  uri
+end
+
+# --------------------------------------------------------------------------
+# Commands
+# --------------------------------------------------------------------------
+
+def cmd_folders
+  db = NotesDB.open_db
+  folders = NotesDB.folders(db)
+  db.close
+  success(folders: folders, count: folders.length)
+end
+
+def cmd_list(options)
+  db = NotesDB.open_db
+  notes = NotesDB.list_notes(db, limit: options[:limit] || 20, folder: options[:folder])
+  db.close
+  success(notes: notes, count: notes.length)
+end
+
+def cmd_show(id, options)
+  db = NotesDB.open_db
+  detail = NotesDB.show_note(db, id)
+  db.close
+
+  uri = detail[:uri]
+
+  if options[:html]
+    detail[:html] = NotesApple.get_html(uri: uri)
+    detail.delete(:body)
+  else
+    # Use AppleScript plaintext for accurate body (SQLite protobuf has noise)
+    detail[:body] = NotesApple.get_plaintext(uri: uri)
+  end
+
+  success(detail)
+end
+
+def cmd_search(query, options)
+  db = NotesDB.open_db
+  results = NotesDB.search_notes(db, query, limit: options[:limit] || 20, folder: options[:folder])
+  db.close
+  success(notes: results, count: results.length, query: query)
+end
+
+def cmd_create(title, options)
+  result = NotesApple.create_note(
+    title: title,
+    body: options[:body],
+    html: options[:html],
+    folder: options[:folder] || "Notes"
+  )
+  success(result)
+end
+
+def cmd_update(id, options)
+  uri = resolve_uri(id)
+
+  results = {}
+
+  if options[:name]
+    results.merge!(NotesApple.update_name(uri: uri, name: options[:name]))
+  end
+
+  if options[:append]
+    results.merge!(NotesApple.append_body(uri: uri, body: options[:append]))
+  elsif options[:body]
+    results.merge!(NotesApple.update_body(uri: uri, body: options[:body]))
+  elsif options[:html]
+    results.merge!(NotesApple.update_body(uri: uri, html: options[:html]))
+  end
+
+  if results.empty?
+    error("Nothing to update. Use --body, --html, --append, or --name.", 'USAGE')
+  end
+
+  z_pk = NotesDB.parse_id(id)
+  results[:id] = z_pk
+  results[:uri] = uri
+  success(results)
+end
+
+def cmd_delete(id)
+  uri = resolve_uri(id)
+  result = NotesApple.delete_note(uri: uri)
+  z_pk = NotesDB.parse_id(id)
+  result[:id] = z_pk
+  result[:uri] = uri
+  success(result)
+end
+
+# --------------------------------------------------------------------------
+# Main
+# --------------------------------------------------------------------------
+
+begin
+  command = ARGV.shift
+  options = {}
+
+  case command
+  when 'folders'
+    cmd_folders
+
+  when 'list', 'ls'
+    OptionParser.new do |opts|
+      opts.on('--limit N', Integer) { |v| options[:limit] = v }
+      opts.on('--folder NAME') { |v| options[:folder] = v }
+    end.parse!
+    cmd_list(options)
+
+  when 'show', 'get'
+    id = ARGV.shift
+    error("Note ID is required. Usage: apple-notes show <ID>", 'USAGE') unless id
+    OptionParser.new do |opts|
+      opts.on('--html') { options[:html] = true }
+    end.parse!
+    cmd_show(id, options)
+
+  when 'search'
+    query = ARGV.shift
+    error("Search query is required. Usage: apple-notes search <query>", 'USAGE') unless query
+    OptionParser.new do |opts|
+      opts.on('--limit N', Integer) { |v| options[:limit] = v }
+      opts.on('--folder NAME') { |v| options[:folder] = v }
+    end.parse!
+    cmd_search(query, options)
+
+  when 'create', 'new'
+    title = ARGV.shift
+    error("Title is required. Usage: apple-notes create \"Title\" [--body TEXT]", 'USAGE') unless title
+    OptionParser.new do |opts|
+      opts.on('--body TEXT') { |v| options[:body] = v }
+      opts.on('--html HTML') { |v| options[:html] = v }
+      opts.on('--folder NAME') { |v| options[:folder] = v }
+    end.parse!
+    cmd_create(title, options)
+
+  when 'update', 'edit'
+    id = ARGV.shift
+    error("Note ID is required. Usage: apple-notes update <ID> [--body TEXT]", 'USAGE') unless id
+    OptionParser.new do |opts|
+      opts.on('--body TEXT') { |v| options[:body] = v }
+      opts.on('--html HTML') { |v| options[:html] = v }
+      opts.on('--append TEXT') { |v| options[:append] = v }
+      opts.on('--name TITLE') { |v| options[:name] = v }
+    end.parse!
+    cmd_update(id, options)
+
+  when 'delete', 'rm'
+    id = ARGV.shift
+    error("Note ID is required. Usage: apple-notes delete <ID>", 'USAGE') unless id
+    cmd_delete(id)
+
+  when '-h', '--help', 'help', nil
+    puts <<~HELP
+      apple-notes - CLI for Apple Notes
+
+      Usage:
+        apple-notes folders                              List all folders
+        apple-notes list   [--limit 20] [--folder NAME]  List recent notes
+        apple-notes show   <ID> [--html]                 Show full note content
+        apple-notes search <query> [--limit 20] [--folder NAME]  Search notes
+        apple-notes create "Title" [--body TEXT] [--html HTML] [--folder NAME]
+        apple-notes update <ID> [--body TEXT] [--html HTML] [--append TEXT] [--name TITLE]
+        apple-notes delete <ID>
+
+      ID can be:
+        - Numeric: 1214
+        - CoreData URI: x-coredata://...../ICNote/p1214
+
+      Read operations (list, show, search, folders) use SQLite for speed.
+      Write operations (create, update, delete) use AppleScript.
+
+      Output: JSON to stdout
+    HELP
+    exit 0
+
+  else
+    error("Unknown command: #{command}. Run 'apple-notes help' for usage.", 'USAGE')
+  end
+
+rescue => e
+  error(e.message, 'ERROR')
+end
